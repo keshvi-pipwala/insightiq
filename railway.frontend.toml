@@ -1,0 +1,9 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "frontend/Dockerfile"
+buildContext = "frontend"
+
+[deploy]
+healthcheckPath = "/"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
