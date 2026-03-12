@@ -1,6 +1,6 @@
 """
 InsightIQ Backend - FastAPI + RAG Pipeline
-v3: SQLite FTS5 for retrieval — no local ML models, fits in 512MB free tier RAM
+v4: Google Gemini API (free tier) + SQLite FTS5 retrieval
 """
 
 import os, re, io, json, sqlite3, logging
@@ -14,40 +14,38 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import anthropic
+import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 _DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 DB_PATH = os.path.join(_DATA_DIR, "insightiq.db")
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+GEMINI_MODEL = "gemini-1.5-flash"
 TOP_K_CHUNKS = 8
 
 DASHBOARD_QUESTIONS = [
-    {"id": "churn_by_plan",    "question": "What is the churn rate for each subscription plan?",              "title": "Churn Rate by Plan"},
-    {"id": "clv_by_category",  "question": "What is the average customer lifetime value by product category?", "title": "Avg CLV by Category"},
-    {"id": "spend_by_plan",    "question": "Show me the average monthly spend for each subscription plan.",    "title": "Monthly Spend by Plan"},
-    {"id": "users_by_country", "question": "What is the distribution of users across countries?",              "title": "Users by Country"},
-    {"id": "nps_by_plan",      "question": "How does average NPS score compare across subscription plans?",    "title": "NPS Score by Plan"},
+    {"id": "churn_by_plan",    "question": "What is the churn rate for each subscription plan?",               "title": "Churn Rate by Plan"},
+    {"id": "clv_by_category",  "question": "What is the average customer lifetime value by product category?",  "title": "Avg CLV by Category"},
+    {"id": "spend_by_plan",    "question": "Show me the average monthly spend for each subscription plan.",     "title": "Monthly Spend by Plan"},
+    {"id": "users_by_country", "question": "What is the distribution of users across countries?",               "title": "Users by Country"},
+    {"id": "nps_by_plan",      "question": "How does average NPS score compare across subscription plans?",     "title": "NPS Score by Plan"},
 ]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(_DATA_DIR, exist_ok=True)
     init_db()
-    logger.info(f"InsightIQ backend v3 started — data dir: {_DATA_DIR}")
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    genai.configure(api_key=api_key)
+    logger.info(f"InsightIQ backend v4 started — data dir: {_DATA_DIR}")
     yield
 
-app = FastAPI(title="InsightIQ API", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="InsightIQ API", version="4.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-_anthropic_client: Optional[anthropic.Anthropic] = None
-def get_anthropic():
-    global _anthropic_client
-    if _anthropic_client is None:
-        _anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-    return _anthropic_client
+def get_model():
+    return genai.GenerativeModel(GEMINI_MODEL)
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
@@ -167,7 +165,7 @@ If you cannot answer from context, say so and use chart_type none."""
 
 def build_msg(question, chunks):
     ctx = "\n\n".join([f"[Context {i+1}]: {c}" for i,c in enumerate(chunks)])
-    return f"Question: {question}\n\nDATA CONTEXT:\n{ctx}\n\nAnswer with insight then JSON chart block."
+    return f"{SYSTEM_PROMPT}\n\nQuestion: {question}\n\nDATA CONTEXT:\n{ctx}\n\nAnswer with insight then JSON chart block."
 
 def parse_chart(text):
     chart = {"chart_type":"none","chart_title":"","chart_labels":[],"chart_values":[],"chart_color":"blue"}
@@ -179,44 +177,52 @@ def parse_chart(text):
         logger.warning(f"Chart parse: {e}")
     return text.strip(), chart
 
-async def stream_claude(question: str, dataset_id: int) -> AsyncGenerator[str, None]:
+async def stream_gemini(question: str, dataset_id: int) -> AsyncGenerator[str, None]:
     try:
         chunks = retrieve_context(question, dataset_id)
         if not chunks:
             yield f"data: {json.dumps({'type':'error','message':'No data found. Upload a dataset first.'})}\n\n"
             return
-        client = get_anthropic()
-        full_text = ""; fence_hit = False
-        with client.messages.stream(model=CLAUDE_MODEL, max_tokens=1500, system=SYSTEM_PROMPT,
-                messages=[{"role":"user","content":build_msg(question,chunks)}]) as stream:
-            for token in stream.text_stream:
-                full_text += token
-                if not fence_hit:
-                    pos = full_text.find("```json")
-                    if pos != -1:
-                        fence_hit = True
-                        prev_len = len(full_text) - len(token)
-                        if pos > prev_len:
-                            yield f"data: {json.dumps({'type':'token','text':full_text[prev_len:pos]})}\n\n"
-                    else:
-                        yield f"data: {json.dumps({'type':'token','text':token})}\n\n"
+
+        model = get_model()
+        full_text = ""
+        fence_hit = False
+
+        response = model.generate_content(build_msg(question, chunks), stream=True)
+        for chunk in response:
+            token = chunk.text if hasattr(chunk, 'text') else ""
+            if not token:
+                continue
+            full_text += token
+            if not fence_hit:
+                pos = full_text.find("```json")
+                if pos != -1:
+                    fence_hit = True
+                    prev_len = len(full_text) - len(token)
+                    if pos > prev_len:
+                        yield f"data: {json.dumps({'type':'token','text':full_text[prev_len:pos]})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type':'token','text':token})}\n\n"
+
         answer, chart = parse_chart(full_text)
         yield f"data: {json.dumps({'type':'chart','data':chart})}\n\n"
+
         try:
             con = get_db()
             con.execute("INSERT INTO query_history (dataset_id,question,answer,chart_data) VALUES (?,?,?,?)",
                 (dataset_id, question, answer, json.dumps(chart)))
             con.commit(); con.close()
         except Exception as e: logger.warning(f"History: {e}")
+
         yield f"data: {json.dumps({'type':'done','context_used':len(chunks)})}\n\n"
     except Exception as e:
         logger.error(f"Stream error: {e}")
         yield f"data: {json.dumps({'type':'error','message':str(e)})}\n\n"
 
-def claude_sync(question, chunks):
-    r = get_anthropic().messages.create(model=CLAUDE_MODEL, max_tokens=800, system=SYSTEM_PROMPT,
-        messages=[{"role":"user","content":build_msg(question,chunks)}])
-    return parse_chart(r.content[0].text)
+def gemini_sync(question, chunks):
+    model = get_model()
+    response = model.generate_content(build_msg(question, chunks))
+    return parse_chart(response.text)
 
 class QueryRequest(BaseModel):
     question: str
@@ -246,7 +252,7 @@ async def upload_csv(file: UploadFile = File(...)):
 @app.post("/query/stream")
 async def query_stream(req: QueryRequest):
     if not req.question.strip(): raise HTTPException(400, "Question cannot be empty.")
-    return StreamingResponse(stream_claude(req.question, req.dataset_id),
+    return StreamingResponse(stream_gemini(req.question, req.dataset_id),
         media_type="text/event-stream", headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 @app.post("/query")
@@ -254,7 +260,7 @@ async def query(req: QueryRequest):
     if not req.question.strip(): raise HTTPException(400, "Empty question.")
     chunks = retrieve_context(req.question, req.dataset_id)
     if not chunks: raise HTTPException(404, "No data. Upload first.")
-    answer, chart = claude_sync(req.question, chunks)
+    answer, chart = gemini_sync(req.question, chunks)
     con = get_db()
     con.execute("INSERT INTO query_history (dataset_id,question,answer,chart_data) VALUES (?,?,?,?)",
         (req.dataset_id, req.question, answer, json.dumps(chart)))
@@ -277,7 +283,7 @@ async def get_dashboard(dataset_id: int, refresh: bool = False):
         try:
             chunks = retrieve_context(q["question"], dataset_id)
             if not chunks: continue
-            answer, chart = claude_sync(q["question"], chunks)
+            answer, chart = gemini_sync(q["question"], chunks)
             panels.append({"id":q["id"],"title":q["title"],"question":q["question"],"answer":answer,"chart_data":chart})
         except Exception as e: logger.warning(f"Panel {q['id']}: {e}")
     con = get_db()
@@ -312,4 +318,4 @@ async def get_history(dataset_id: int = 1, limit: int = 20):
 
 @app.get("/health")
 async def health():
-    return {"status":"ok","version":"3.0.0","timestamp":datetime.utcnow().isoformat()}
+    return {"status":"ok","version":"4.0.0","timestamp":datetime.utcnow().isoformat()}
