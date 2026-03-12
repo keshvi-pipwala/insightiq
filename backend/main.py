@@ -36,7 +36,7 @@ DASHBOARD_QUESTIONS = [
 async def lifespan(app: FastAPI):
     os.makedirs(_DATA_DIR, exist_ok=True)
     init_db()
-    api_key = os.environ.get("GEMINI_API_KEY", "")
+    api_key = os.environ.get("GOOGLE_API_KEY", "")
     genai.configure(api_key=api_key)
     logger.info(f"InsightIQ backend v4 started — data dir: {_DATA_DIR}")
     yield
