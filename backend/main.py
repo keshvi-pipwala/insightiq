@@ -1,6 +1,6 @@
 """
-InsightIQ Backend - FastAPI + RAG Pipeline
-v4: Google Gemini API (free tier) + SQLite FTS5 retrieval
+InsightIQ Backend v5 - FastAPI + RAG Pipeline
+Uses Gemini REST API directly (no google library) + SQLite FTS5
 """
 
 import os, re, io, json, sqlite3, logging
@@ -10,11 +10,11 @@ from contextlib import asynccontextmanager
 
 import pandas as pd
 import numpy as np
+import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -36,16 +36,19 @@ DASHBOARD_QUESTIONS = [
 async def lifespan(app: FastAPI):
     os.makedirs(_DATA_DIR, exist_ok=True)
     init_db()
-    api_key = os.environ.get("GOOGLE_API_KEY", "")
-    genai.configure(api_key=api_key)
-    logger.info(f"InsightIQ backend v4 started — data dir: {_DATA_DIR}")
+    logger.info(f"InsightIQ backend v5 started — data dir: {_DATA_DIR}")
     yield
 
-app = FastAPI(title="InsightIQ API", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="InsightIQ API", version="5.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-def get_model():
-    return genai.GenerativeModel(GEMINI_MODEL)
+def call_gemini(prompt: str) -> str:
+    api_key = os.environ.get("GOOGLE_API_KEY", "")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    r = httpx.post(url, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()["candidates"][0]["content"]["parts"][0]["text"]
 
 def init_db():
     con = sqlite3.connect(DB_PATH)
@@ -119,7 +122,6 @@ def store_chunks(chunks, dataset_id):
     con.executemany("INSERT INTO chunks_fts (chunk_id,dataset_id,chunk_text,chunk_type) VALUES (?,?,?,?)",
         [(c["id"], dataset_id, c["text"], c["type"]) for c in chunks])
     con.commit(); con.close()
-    logger.info(f"Stored {len(chunks)} chunks for dataset {dataset_id}")
 
 def retrieve_context(question: str, dataset_id: int) -> list[str]:
     con = get_db()
@@ -143,13 +145,8 @@ def retrieve_context(question: str, dataset_id: int) -> list[str]:
 
 SYSTEM_PROMPT = """You are InsightIQ, an elite product analytics AI assistant.
 Answer questions about business data with precision and insight.
-
-RULES:
-- Answer ONLY from the provided data context. Never invent statistics.
-- Be concise but insightful. Lead with the key finding.
-- Always end with a JSON chart block.
-
-REQUIRED OUTPUT FORMAT — write your answer first, then:
+Answer ONLY from the provided data context. Never invent statistics.
+Always end with a JSON chart block:
 ```json
 {
   "chart_type": "bar" | "line" | "pie" | "none",
@@ -158,10 +155,7 @@ REQUIRED OUTPUT FORMAT — write your answer first, then:
   "chart_values": [number1, number2],
   "chart_color": "blue" | "green" | "red" | "purple" | "orange"
 }
-```
-
-Choose chart_type: bar=comparisons, line=trends, pie=proportions, none=no chart fits.
-If you cannot answer from context, say so and use chart_type none."""
+```"""
 
 def build_msg(question, chunks):
     ctx = "\n\n".join([f"[Context {i+1}]: {c}" for i,c in enumerate(chunks)])
@@ -177,52 +171,36 @@ def parse_chart(text):
         logger.warning(f"Chart parse: {e}")
     return text.strip(), chart
 
-async def stream_gemini(question: str, dataset_id: int) -> AsyncGenerator[str, None]:
+async def stream_response(question: str, dataset_id: int) -> AsyncGenerator[str, None]:
     try:
         chunks = retrieve_context(question, dataset_id)
         if not chunks:
             yield f"data: {json.dumps({'type':'error','message':'No data found. Upload a dataset first.'})}\n\n"
             return
-
-        model = get_model()
-        full_text = ""
-        fence_hit = False
-
-        response = model.generate_content(build_msg(question, chunks), stream=True)
-        for chunk in response:
-            token = chunk.text if hasattr(chunk, 'text') else ""
-            if not token:
-                continue
-            full_text += token
-            if not fence_hit:
-                pos = full_text.find("```json")
-                if pos != -1:
-                    fence_hit = True
-                    prev_len = len(full_text) - len(token)
-                    if pos > prev_len:
-                        yield f"data: {json.dumps({'type':'token','text':full_text[prev_len:pos]})}\n\n"
-                else:
-                    yield f"data: {json.dumps({'type':'token','text':token})}\n\n"
-
+        full_text = call_gemini(build_msg(question, chunks))
+        fence_pos = full_text.find("```json")
+        answer_part = full_text[:fence_pos].strip() if fence_pos != -1 else full_text.strip()
+        # Stream answer word by word
+        words = answer_part.split(" ")
+        for i, word in enumerate(words):
+            token = word + (" " if i < len(words)-1 else "")
+            yield f"data: {json.dumps({'type':'token','text':token})}\n\n"
         answer, chart = parse_chart(full_text)
         yield f"data: {json.dumps({'type':'chart','data':chart})}\n\n"
-
         try:
             con = get_db()
             con.execute("INSERT INTO query_history (dataset_id,question,answer,chart_data) VALUES (?,?,?,?)",
                 (dataset_id, question, answer, json.dumps(chart)))
             con.commit(); con.close()
         except Exception as e: logger.warning(f"History: {e}")
-
         yield f"data: {json.dumps({'type':'done','context_used':len(chunks)})}\n\n"
     except Exception as e:
         logger.error(f"Stream error: {e}")
         yield f"data: {json.dumps({'type':'error','message':str(e)})}\n\n"
 
 def gemini_sync(question, chunks):
-    model = get_model()
-    response = model.generate_content(build_msg(question, chunks))
-    return parse_chart(response.text)
+    text = call_gemini(build_msg(question, chunks))
+    return parse_chart(text)
 
 class QueryRequest(BaseModel):
     question: str
@@ -252,7 +230,7 @@ async def upload_csv(file: UploadFile = File(...)):
 @app.post("/query/stream")
 async def query_stream(req: QueryRequest):
     if not req.question.strip(): raise HTTPException(400, "Question cannot be empty.")
-    return StreamingResponse(stream_gemini(req.question, req.dataset_id),
+    return StreamingResponse(stream_response(req.question, req.dataset_id),
         media_type="text/event-stream", headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 @app.post("/query")
@@ -318,4 +296,4 @@ async def get_history(dataset_id: int = 1, limit: int = 20):
 
 @app.get("/health")
 async def health():
-    return {"status":"ok","version":"4.0.0","timestamp":datetime.utcnow().isoformat()}
+    return {"status":"ok","version":"5.0.0","timestamp":datetime.utcnow().isoformat()}
