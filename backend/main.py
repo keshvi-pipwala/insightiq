@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 _DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 DB_PATH = os.path.join(_DATA_DIR, "insightiq.db")
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-2.0-flash-exp"
 TOP_K_CHUNKS = 8
 
 DASHBOARD_QUESTIONS = [
