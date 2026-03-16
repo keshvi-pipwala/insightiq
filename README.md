@@ -10,7 +10,7 @@
 
 > Ask natural language questions about your product data. Get AI-powered answers **streamed in real-time** — grounded in your actual data via RAG, with auto-generated charts.
 
-**🚀 [Live Demo](https://your-frontend-url.railway.app)** &nbsp;·&nbsp; **[Deploy your own →](./DEPLOY.md)**
+**🚀 [Live Demo](https://insightiq-frontend-jn6h.onrender.com)** &nbsp;·&nbsp; **[Deploy your own →](./DEPLOY.md)**
 
 ---
 
